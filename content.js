@@ -21,6 +21,9 @@
     // If we are already within this many seconds of the segment end, do not bother skipping.
     nearEndToleranceSeconds: 1.0,
 
+    // Collapse nearby skip ranges into one jump instead of hopping segment by segment.
+    chainGapToleranceSeconds: 10.0,
+
     // How often to re-check for SPA route changes and video availability.
     routePollMs: 750,
 
@@ -169,26 +172,65 @@
       return false;
     }
 
+    if (getTargetTime(video, segment.end) <= t) {
+      return false;
+    }
+
     return true;
   }
 
-  async function skipSegment(video, segment) {
-    const key = segmentKey(segment);
-    skippedSegmentKeys.add(key);
+  function getTargetTime(video, segmentEnd) {
+    return Math.min(
+      segmentEnd + CONFIG.endPaddingSeconds,
+      Number.isFinite(video.duration) ? Math.max(video.duration - 0.1, 0) : segmentEnd + CONFIG.endPaddingSeconds
+    );
+  }
+
+  function buildSkipPlan(video, firstSegment) {
+    let end = firstSegment.end;
+    const segments = [firstSegment];
+
+    for (const candidate of currentSegments) {
+      if (candidate === firstSegment || skippedSegmentKeys.has(segmentKey(candidate))) {
+        continue;
+      }
+
+      if (candidate.start < firstSegment.start || candidate.end <= end) {
+        continue;
+      }
+
+      if (candidate.start > end + CONFIG.chainGapToleranceSeconds) {
+        break;
+      }
+
+      segments.push(candidate);
+      end = candidate.end;
+    }
+
+    const targetTime = getTargetTime(video, end);
+
+    if (targetTime <= video.currentTime) {
+      return null;
+    }
+
+    return { segments, targetTime };
+  }
+
+  async function skipSegment(video, plan) {
+    for (const segment of plan.segments) {
+      skippedSegmentKeys.add(segmentKey(segment));
+    }
 
     const wasPaused = video.paused;
-    const targetTime = Math.min(
-      segment.end + CONFIG.endPaddingSeconds,
-      Number.isFinite(video.duration) ? Math.max(video.duration - 0.1, 0) : segment.end + CONFIG.endPaddingSeconds
-    );
 
-    log(`skipping ${segment.type}`, {
+    log("skipping", {
+      types: plan.segments.map((segment) => segment.type),
       from: video.currentTime,
-      to: targetTime,
+      to: plan.targetTime,
       wasPaused
     });
 
-    video.currentTime = targetTime;
+    video.currentTime = plan.targetTime;
 
     // If the user/player was already playing, keep it playing after the jump.
     // This may be rejected by the browser if there has not been a user gesture.
@@ -211,7 +253,11 @@
     const segment = currentSegments.find((candidate) => shouldSkip(video, candidate));
 
     if (segment) {
-      skipSegment(video, segment);
+      const plan = buildSkipPlan(video, segment);
+
+      if (plan) {
+        skipSegment(video, plan);
+      }
     }
   }
 

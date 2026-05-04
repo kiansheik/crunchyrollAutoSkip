@@ -53,4 +53,6 @@ Then open DevTools on the Crunchyroll page and check the console.
 ## Notes
 
 - The extension skips each segment once per episode load. If you manually rewind into a skipped intro/recap, it should not immediately fight you by skipping it again.
+- When nearby skip ranges appear together, the extension jumps to the end of the later range in one seek instead of hopping through each segment one by one.
+- The extension only seeks forward. It will not move playback backward to reach a skip segment.
 - If Crunchyroll changes the player structure or the skip-events JSON format, `content.js` is the file to patch.
