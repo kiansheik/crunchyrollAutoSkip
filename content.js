@@ -1,6 +1,16 @@
 (() => {
   "use strict";
 
+  if (globalThis.__crAutoSkipperActive) {
+    console.log("[Crunchyroll Auto Skipper] duplicate injection detected; asking existing script to resync");
+    window.dispatchEvent(new CustomEvent("cr-skipper-force-resync", {
+      detail: { reason: "duplicate-injection" }
+    }));
+    return;
+  }
+
+  globalThis.__crAutoSkipperActive = true;
+
   /**
    * Crunchyroll Auto Skipper
    *
@@ -27,6 +37,10 @@
     // How often to re-check for SPA route changes and video availability.
     routePollMs: 750,
 
+    // Keep route polling disabled while debugging resume/startup races. History
+    // events, DOM mutations, and the toolbar resync still refresh state.
+    enableRoutePoll: false,
+
     // Only consider proactive startup skips for early segments. This keeps startup
     // recaps fast without allowing a future intro to skip real episode content.
     proactiveSkipThresholdSeconds: 120,
@@ -39,6 +53,19 @@
     // reach it instead of jumping there immediately.
     proactiveSkipStartToleranceSeconds: 2.0,
 
+    // Disabled while debugging resume behavior. With this off, the extension
+    // only skips after playback is actually inside a segment, except for the
+    // short studio-credit preroll case below.
+    proactiveSkipEnabled: false,
+
+    // Keep the Toei/studio producer-card shortcut even while broad proactive
+    // skipping is disabled. This still waits for playback to start first.
+    shortPrerollProactiveSkipEnabled: true,
+
+    // Avoid deciding anything from loadedmetadata/canplay before Crunchyroll has
+    // applied its own resume point.
+    requirePlaybackStartedBeforeSkip: true,
+
     // Keep verbose while debugging. Turn off before publishing.
     debug: true,
 
@@ -47,7 +74,30 @@
     mirrorDebugToServiceWorker: true,
 
     // Avoid flooding the console with every timeupdate while still showing state.
-    videoStateLogIntervalMs: 2000
+    videoStateLogIntervalMs: 2000,
+
+    // A seek is only considered successful after the player stays near the
+    // requested target for this long. Crunchyroll can reset early seeks while
+    // the next episode is still hydrating.
+    skipConfirmDelayMs: 2500,
+
+    // If the player did not land on the target, retry at this cadence.
+    skipRetryDelayMs: 500,
+
+    // Accept tiny differences between requested and reported playback time.
+    skipConfirmToleranceSeconds: 0.75,
+
+    // After a confirmed skip, keep watching briefly for Crunchyroll resetting
+    // playback back before the skipped segment.
+    skipRollbackWatchMs: 10000,
+
+    // Hard loop breakers. If Crunchyroll keeps rejecting the same seek, stop
+    // fighting it for a while instead of trapping playback in repeated jumps.
+    maxPendingSkipAttempts: 10,
+    maxPendingSkipAgeMs: 25000,
+    maxSkipPlanAttempts: 6,
+    skipAttemptWindowMs: 30000,
+    skipLoopSuppressMs: 90000
   };
 
   let currentMediaId = null;
@@ -61,6 +111,15 @@
   let lastVideoStateLogAt = 0;
   let lastVideoScanLogAt = 0;
   let lastProactiveLogAt = 0;
+  let pendingSkip = null;
+  let skipRetryTimer = null;
+  let confirmedSkipWatch = null;
+  let skipPlanAttemptRecords = new Map();
+  let suppressedSegmentKeys = new Map();
+  let nextPendingSkipId = 1;
+  let lastSuppressedSkipLogAt = 0;
+  let playbackStartedForMedia = false;
+  let lastWaitingForPlayLogAt = 0;
   const preloadedIds = new Set();
   const videoDebugIds = new WeakMap();
   let nextVideoDebugId = 1;
@@ -113,6 +172,58 @@
     return value;
   }
 
+  function formatLogValue(value) {
+    if (value === null) return "null";
+    if (value === undefined) return "undefined";
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? String(Number(value.toFixed(3))) : String(value);
+    }
+    if (typeof value === "boolean") return value ? "true" : "false";
+    if (typeof value === "string") return JSON.stringify(value.length > 140 ? `${value.slice(0, 137)}...` : value);
+    return JSON.stringify(value);
+  }
+
+  function flattenLogDetails(value, prefix = "", output = []) {
+    if (output.length >= 36 || value === undefined) {
+      return output;
+    }
+
+    if (value === null || typeof value !== "object") {
+      output.push(`${prefix || "value"}=${formatLogValue(value)}`);
+      return output;
+    }
+
+    if (Array.isArray(value)) {
+      output.push(`${prefix || "items"}[${value.length}]`);
+      for (let index = 0; index < Math.min(value.length, 3); index += 1) {
+        flattenLogDetails(value[index], `${prefix || "item"}${index}`, output);
+      }
+      return output;
+    }
+
+    for (const [key, item] of Object.entries(value)) {
+      if (output.length >= 36) break;
+      if (item === undefined || typeof item === "function") continue;
+      const nextPrefix = prefix ? `${prefix}.${key}` : key;
+      if (item && typeof item === "object" && !Array.isArray(item)) {
+        flattenLogDetails(item, nextPrefix, output);
+      } else {
+        flattenLogDetails(item, nextPrefix, output);
+      }
+    }
+
+    return output;
+  }
+
+  function formatDetailsForLog(details) {
+    if (details === undefined) {
+      return "";
+    }
+
+    const parts = flattenLogDetails(sanitizeDebugValue(details));
+    return parts.length ? ` ${parts.join(" ")}` : "";
+  }
+
   function mirrorLogToServiceWorker(entry) {
     if (!CONFIG.mirrorDebugToServiceWorker) {
       return;
@@ -140,8 +251,9 @@
       return;
     }
 
+    const sequence = ++debugSequence;
     const entry = {
-      sequence: ++debugSequence,
+      sequence,
       at: new Date().toISOString(),
       step,
       mediaId: currentMediaId,
@@ -149,8 +261,11 @@
       fullscreen: Boolean(document.fullscreenElement),
       details: sanitizeDebugValue(details)
     };
+    entry.line = `[Crunchyroll Auto Skipper] #${entry.sequence} ${entry.at} ${step}`
+      + ` media=${entry.mediaId || "none"} path=${entry.path || "/"} fullscreen=${entry.fullscreen ? "yes" : "no"}`
+      + formatDetailsForLog(details);
 
-    console.log("[Crunchyroll Auto Skipper]", entry);
+    console.log(entry.line);
     mirrorLogToServiceWorker(entry);
   }
 
@@ -169,6 +284,11 @@
 
   function teardown(reason = "teardown") {
     log("extension:teardown", { reason });
+    clearPendingSkip(`teardown:${reason}`);
+    clearConfirmedSkipWatch(`teardown:${reason}`);
+    clearLoopBreakerState(`teardown:${reason}`);
+    playbackStartedForMedia = false;
+    lastWaitingForPlayLogAt = 0;
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -258,6 +378,11 @@
       segmentCount: currentSegments.length,
       segments: currentSegments,
       skippedSegmentKeys: [...skippedSegmentKeys],
+      pendingSkip: pendingSkip ? sanitizeDebugValue(pendingSkip) : null,
+      confirmedSkipWatch: confirmedSkipWatch ? sanitizeDebugValue(confirmedSkipWatch) : null,
+      suppressedSegmentKeys: getSuppressedSegmentSnapshot(),
+      skipPlanAttemptRecords: getSkipPlanAttemptSnapshot(),
+      playbackStartedForMedia,
       attachedVideo: describeVideo(attachedVideo),
       videos: [...document.querySelectorAll("video")].map(describeVideo)
     };
@@ -413,6 +538,11 @@
     currentMediaId = mediaId;
     currentSegments = [];
     skippedSegmentKeys = new Set();
+    clearPendingSkip(`episode-load:${mediaId}`);
+    clearConfirmedSkipWatch(`episode-load:${mediaId}`);
+    clearLoopBreakerState(`episode-load:${mediaId}`);
+    playbackStartedForMedia = false;
+    lastWaitingForPlayLogAt = 0;
     lastVideoStateLogAt = 0;
 
     log("episode:load:start", {
@@ -521,6 +651,13 @@
   }
 
   function onVideoEvent(event) {
+    if (event.type === "play") {
+      playbackStartedForMedia = true;
+      log("video:playback-started", { video: event.currentTarget });
+      onTimeUpdate("play");
+      return;
+    }
+
     if (event.type === "timeupdate") {
       if (Date.now() - lastVideoStateLogAt >= CONFIG.videoStateLogIntervalMs) {
         lastVideoStateLogAt = Date.now();
@@ -545,6 +682,571 @@
 
   function segmentKey(segment) {
     return `${currentMediaId}:${segment.type}:${segment.start}:${segment.end}`;
+  }
+
+  function clearSkipRetryTimer() {
+    if (!skipRetryTimer) {
+      return;
+    }
+
+    clearTimeout(skipRetryTimer);
+    skipRetryTimer = null;
+  }
+
+  function clearPendingSkip(reason) {
+    if (!pendingSkip) {
+      clearSkipRetryTimer();
+      return;
+    }
+
+    log("skip:pending:cleared", {
+      reason,
+      pendingSkip
+    });
+    pendingSkip = null;
+    clearSkipRetryTimer();
+  }
+
+  function clearConfirmedSkipWatch(reason) {
+    if (!confirmedSkipWatch) {
+      return;
+    }
+
+    log("skip:confirmed-watch:cleared", {
+      reason,
+      confirmedSkipWatch
+    });
+    confirmedSkipWatch = null;
+  }
+
+  function clearLoopBreakerState(reason) {
+    const suppressedCount = suppressedSegmentKeys.size;
+    const attemptRecordCount = skipPlanAttemptRecords.size;
+
+    if (suppressedCount || attemptRecordCount) {
+      log("skip:loop-breaker:cleared", {
+        reason,
+        suppressedCount,
+        attemptRecordCount
+      });
+    }
+
+    suppressedSegmentKeys = new Map();
+    skipPlanAttemptRecords = new Map();
+    lastSuppressedSkipLogAt = 0;
+  }
+
+  function clearExpiredSuppressedSegments(now = Date.now()) {
+    for (const [key, expiresAtMs] of suppressedSegmentKeys.entries()) {
+      if (expiresAtMs <= now) {
+        suppressedSegmentKeys.delete(key);
+      }
+    }
+  }
+
+  function getSuppressedSegmentSnapshot() {
+    clearExpiredSuppressedSegments();
+    return [...suppressedSegmentKeys.entries()].map(([key, expiresAtMs]) => ({
+      key,
+      expiresAtMs
+    }));
+  }
+
+  function getSkipPlanAttemptSnapshot() {
+    return [...skipPlanAttemptRecords.entries()].map(([key, record]) => ({
+      key,
+      firstAttemptAtMs: record.firstAttemptAtMs,
+      lastAttemptAtMs: record.lastAttemptAtMs,
+      attempts: record.attempts,
+      segmentKeys: record.segmentKeys
+    }));
+  }
+
+  function isSegmentSuppressed(key) {
+    clearExpiredSuppressedSegments();
+    return suppressedSegmentKeys.has(key);
+  }
+
+  function hasSuppressedSegment(segmentKeys) {
+    return segmentKeys.some((key) => isSegmentSuppressed(key));
+  }
+
+  function logSuppressedSkipBlocked(source, reason, details = {}) {
+    const now = Date.now();
+    if (now - lastSuppressedSkipLogAt < CONFIG.videoStateLogIntervalMs) {
+      return;
+    }
+
+    lastSuppressedSkipLogAt = now;
+    log("skip:loop-breaker:blocked", {
+      source,
+      reason,
+      ...details,
+      suppressedSegmentKeys: getSuppressedSegmentSnapshot()
+    });
+  }
+
+  function suppressSegmentKeys(segmentKeys, reason, details = {}) {
+    const now = Date.now();
+    const expiresAtMs = now + CONFIG.skipLoopSuppressMs;
+    const keys = [...new Set(segmentKeys)];
+
+    for (const key of keys) {
+      suppressedSegmentKeys.set(key, expiresAtMs);
+      skippedSegmentKeys.add(key);
+    }
+
+    log("skip:loop-breaker:suppressed", {
+      reason,
+      suppressMs: CONFIG.skipLoopSuppressMs,
+      expiresAtMs,
+      segmentKeys: keys,
+      ...details
+    });
+  }
+
+  function skipPlanKey(segmentKeys) {
+    return segmentKeys.join("|");
+  }
+
+  function recordSkipPlanAttempt(segmentKeys, source) {
+    clearExpiredSuppressedSegments();
+
+    if (hasSuppressedSegment(segmentKeys)) {
+      logSuppressedSkipBlocked(source, "segment-temporarily-suppressed", {
+        segmentKeys
+      });
+      return false;
+    }
+
+    const now = Date.now();
+    const key = skipPlanKey(segmentKeys);
+    let record = skipPlanAttemptRecords.get(key);
+    if (!record || now - record.firstAttemptAtMs > CONFIG.skipAttemptWindowMs) {
+      record = {
+        firstAttemptAtMs: now,
+        lastAttemptAtMs: now,
+        attempts: 0,
+        segmentKeys: [...segmentKeys]
+      };
+    }
+
+    record.attempts += 1;
+    record.lastAttemptAtMs = now;
+    record.segmentKeys = [...segmentKeys];
+    skipPlanAttemptRecords.set(key, record);
+
+    if (record.attempts > CONFIG.maxSkipPlanAttempts) {
+      suppressSegmentKeys(segmentKeys, "too-many-skip-plan-attempts", {
+        source,
+        attempts: record.attempts,
+        maxAttempts: CONFIG.maxSkipPlanAttempts,
+        attemptWindowMs: CONFIG.skipAttemptWindowMs
+      });
+      return false;
+    }
+
+    return true;
+  }
+
+  function abandonPendingSkip(reason, source) {
+    if (!pendingSkip) {
+      return;
+    }
+
+    suppressSegmentKeys(pendingSkip.segmentKeys, reason, {
+      source,
+      pendingSkip
+    });
+    clearPendingSkip(reason);
+  }
+
+  function shouldAbandonPendingSkip(source) {
+    if (!pendingSkip) {
+      return false;
+    }
+
+    const ageMs = Date.now() - pendingSkip.createdAtMs;
+    if (pendingSkip.attempts >= CONFIG.maxPendingSkipAttempts) {
+      abandonPendingSkip("too-many-pending-skip-attempts", source);
+      return true;
+    }
+
+    if (ageMs >= CONFIG.maxPendingSkipAgeMs) {
+      abandonPendingSkip("pending-skip-too-old", source);
+      return true;
+    }
+
+    return false;
+  }
+
+  function startConfirmedSkipWatch(source, confirmedSkip) {
+    confirmedSkipWatch = {
+      id: confirmedSkip.id,
+      mediaId: confirmedSkip.mediaId,
+      segmentKeys: [...confirmedSkip.segmentKeys],
+      segments: confirmedSkip.segments,
+      types: [...confirmedSkip.types],
+      targetTime: confirmedSkip.targetTime,
+      startedAtMs: Date.now(),
+      expiresAtMs: Date.now() + CONFIG.skipRollbackWatchMs
+    };
+
+    log("skip:confirmed-watch:start", {
+      source,
+      watchMs: CONFIG.skipRollbackWatchMs,
+      confirmedSkipWatch
+    });
+  }
+
+  function unmarkCurrentEpisodeSegments(reason) {
+    const removedKeys = [];
+    for (const segment of currentSegments) {
+      const key = segmentKey(segment);
+      if (skippedSegmentKeys.delete(key)) {
+        removedKeys.push(key);
+      }
+    }
+
+    if (removedKeys.length) {
+      log("skip:segments-unmarked", {
+        reason,
+        removedKeys
+      });
+    }
+  }
+
+  function retryConfirmedSkipAfterRollback(video, source, reason) {
+    const watch = confirmedSkipWatch;
+    if (!watch) {
+      return false;
+    }
+
+    clearConfirmedSkipWatch(reason);
+    for (const key of watch.segmentKeys) {
+      skippedSegmentKeys.delete(key);
+    }
+
+    const plan = {
+      segments: watch.segments,
+      targetTime: watch.targetTime
+    };
+
+    log("skip:confirmed-watch:rollback", {
+      source,
+      reason,
+      currentTime: video && video.currentTime,
+      targetTime: watch.targetTime,
+      plan,
+      video
+    });
+    skipSegment(video, plan, `rollback:${source}`);
+    return true;
+  }
+
+  function recoverRolledBackSkip(video, source) {
+    if (!confirmedSkipWatch) {
+      return false;
+    }
+
+    if (confirmedSkipWatch.mediaId !== currentMediaId) {
+      clearConfirmedSkipWatch("media-changed");
+      return false;
+    }
+
+    if (Date.now() > confirmedSkipWatch.expiresAtMs) {
+      clearConfirmedSkipWatch("rollback-watch-expired");
+      return false;
+    }
+
+    if (!video || !Number.isFinite(video.currentTime)) {
+      return false;
+    }
+
+    if (video.currentTime >= confirmedSkipWatch.targetTime - CONFIG.skipConfirmToleranceSeconds) {
+      return false;
+    }
+
+    return retryConfirmedSkipAfterRollback(video, source, "playback-rolled-back-before-target");
+  }
+
+  function recoverSkippedSegmentStillPlaying(video, source) {
+    if (!video || !currentSegments.length || !Number.isFinite(video.currentTime)) {
+      return false;
+    }
+
+    const t = video.currentTime;
+    const segment = currentSegments.find((candidate) => {
+      const key = segmentKey(candidate);
+      if (!skippedSegmentKeys.has(key)) {
+        return false;
+      }
+
+      return t >= candidate.start
+        && t < candidate.end
+        && (candidate.end - t) > CONFIG.nearEndToleranceSeconds;
+    });
+
+    if (!segment) {
+      return false;
+    }
+
+    const key = segmentKey(segment);
+    if (isSegmentSuppressed(key)) {
+      logSuppressedSkipBlocked(source, "marked-skipped-segment-still-playing", {
+        currentTime: t,
+        segment,
+        key,
+        video
+      });
+      return false;
+    }
+
+    log("skip:marked-skipped-segment-still-playing", {
+      source,
+      currentTime: t,
+      segment,
+      skippedSegmentKeys: [...skippedSegmentKeys],
+      video
+    });
+
+    unmarkCurrentEpisodeSegments("marked-skipped-segment-still-playing");
+    clearConfirmedSkipWatch("marked-skipped-segment-still-playing");
+
+    const plan = buildSkipPlan(video, segment);
+    if (!plan) {
+      return false;
+    }
+
+    skipSegment(video, plan, `stale-skipped-state:${source}`);
+    return true;
+  }
+
+  function canEvaluateSkipDecisions(video, source) {
+    if (!video) {
+      return false;
+    }
+
+    if (!Number.isFinite(video.currentTime)) {
+      return false;
+    }
+
+    if (!playbackStartedForMedia && !video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      playbackStartedForMedia = true;
+      log("video:playback-started:inferred", {
+        source,
+        currentTime: video.currentTime,
+        readyState: video.readyState,
+        video
+      });
+    }
+
+    if (CONFIG.requirePlaybackStartedBeforeSkip && !playbackStartedForMedia) {
+      const now = Date.now();
+      if (now - lastWaitingForPlayLogAt >= CONFIG.videoStateLogIntervalMs) {
+        lastWaitingForPlayLogAt = now;
+        log("skip:decision:waiting-for-play", {
+          source,
+          currentTime: video.currentTime,
+          paused: video.paused,
+          readyState: video.readyState,
+          video
+        });
+      }
+      return false;
+    }
+
+    return true;
+  }
+
+  function samePendingPlan(plan, segmentKeys) {
+    if (!pendingSkip || pendingSkip.mediaId !== currentMediaId) {
+      return false;
+    }
+
+    if (pendingSkip.segmentKeys.length !== segmentKeys.length) {
+      return false;
+    }
+
+    return pendingSkip.segmentKeys.every((key, index) => key === segmentKeys[index])
+      && Math.abs(pendingSkip.targetTime - plan.targetTime) <= CONFIG.skipConfirmToleranceSeconds;
+  }
+
+  function isPendingSkipConfirmed(video) {
+    if (!pendingSkip || !video || pendingSkip.mediaId !== currentMediaId) {
+      return false;
+    }
+
+    if (Date.now() < pendingSkip.confirmAfterMs) {
+      return false;
+    }
+
+    const t = video.currentTime;
+    return Number.isFinite(t)
+      && t >= pendingSkip.targetTime - CONFIG.skipConfirmToleranceSeconds;
+  }
+
+  function confirmPendingSkip(video, source) {
+    if (!pendingSkip) {
+      return false;
+    }
+
+    if (pendingSkip.mediaId !== currentMediaId) {
+      clearPendingSkip("media-changed-before-confirm");
+      return false;
+    }
+
+    if (!isPendingSkipConfirmed(video)) {
+      return false;
+    }
+
+    for (const key of pendingSkip.segmentKeys) {
+      skippedSegmentKeys.add(key);
+    }
+
+    log("skip:pending:confirmed", {
+      source,
+      pendingSkip,
+      actualTime: video.currentTime,
+      video
+    });
+
+    const confirmedSkip = {
+      id: pendingSkip.id,
+      mediaId: pendingSkip.mediaId,
+      segmentKeys: [...pendingSkip.segmentKeys],
+      segments: pendingSkip.segments,
+      types: [...pendingSkip.types],
+      targetTime: pendingSkip.targetTime
+    };
+    const types = [...pendingSkip.types];
+    startConfirmedSkipWatch(source, confirmedSkip);
+    clearPendingSkip("confirmed");
+    showSkipOverlay(video, types);
+    return true;
+  }
+
+  function schedulePendingSkipRetry(source) {
+    if (!pendingSkip) {
+      return;
+    }
+
+    if (skipRetryTimer) {
+      return;
+    }
+
+    skipRetryTimer = setTimeout(() => {
+      skipRetryTimer = null;
+      retryPendingSkip(`timer:${source}`);
+    }, CONFIG.skipRetryDelayMs);
+
+    log("skip:pending:retry-scheduled", {
+      source,
+      retryInMs: CONFIG.skipRetryDelayMs,
+      pendingSkip
+    });
+  }
+
+  async function attemptPendingSkip(video, source) {
+    if (!pendingSkip) {
+      return;
+    }
+
+    if (!video) {
+      log("skip:pending:attempt-waiting-for-video", {
+        source,
+        pendingSkip
+      });
+      schedulePendingSkipRetry(source);
+      return;
+    }
+
+    if (pendingSkip.mediaId !== currentMediaId) {
+      clearPendingSkip("media-changed-before-attempt");
+      return;
+    }
+
+    if (confirmPendingSkip(video, `${source}:before-attempt`)) {
+      return;
+    }
+
+    if (shouldAbandonPendingSkip(source)) {
+      return;
+    }
+
+    clearSkipRetryTimer();
+
+    pendingSkip.attempts += 1;
+    pendingSkip.lastAttemptAtMs = Date.now();
+    pendingSkip.confirmAfterMs = Date.now() + CONFIG.skipConfirmDelayMs;
+    pendingSkip.videoDebugId = getVideoDebugId(video);
+
+    log("skip:pending:attempt", {
+      source,
+      pendingSkip,
+      from: video.currentTime,
+      to: pendingSkip.targetTime,
+      video
+    });
+
+    try {
+      video.currentTime = pendingSkip.targetTime;
+      log("skip:pending:seek-set", {
+        source,
+        requestedTime: pendingSkip.targetTime,
+        actualTime: video.currentTime,
+        pendingSkip,
+        video
+      });
+    } catch (error) {
+      log("skip:pending:seek-error", {
+        source,
+        error,
+        pendingSkip,
+        video
+      });
+      schedulePendingSkipRetry(source);
+      return;
+    }
+
+    if (!pendingSkip.wasPaused) {
+      try {
+        await video.play();
+        log("skip:pending:play-resumed", {
+          source,
+          pendingSkip,
+          video
+        });
+      } catch (error) {
+        log("skip:pending:play-blocked", {
+          source,
+          error,
+          pendingSkip,
+          video
+        });
+      }
+    }
+
+    schedulePendingSkipRetry(source);
+  }
+
+  function retryPendingSkip(source) {
+    if (!pendingSkip) {
+      return false;
+    }
+
+    const video = attachedVideo || findVideo("pending-skip-retry");
+    if (confirmPendingSkip(video, source)) {
+      return true;
+    }
+
+    if (Date.now() - pendingSkip.lastAttemptAtMs < CONFIG.skipRetryDelayMs) {
+      schedulePendingSkipRetry(source);
+      return true;
+    }
+
+    attemptPendingSkip(video, source);
+    return true;
   }
 
   function evaluateSegment(video, segment) {
@@ -719,52 +1421,64 @@
     }, 800);
   }
 
-  async function skipSegment(video, plan) {
-    for (const segment of plan.segments) {
-      skippedSegmentKeys.add(segmentKey(segment));
-    }
-
-    const wasPaused = video.paused;
+  function skipSegment(video, plan, source = "skip-request") {
+    const segmentKeys = plan.segments.map((segment) => segmentKey(segment));
     const types = plan.segments.map((segment) => segment.type);
 
-    log("skip:perform:start", {
-      types,
-      from: video.currentTime,
-      to: plan.targetTime,
-      wasPaused,
-      plan,
-      video
-    });
-
-    try {
-      video.currentTime = plan.targetTime;
-      log("skip:perform:seek-set", {
-        requestedTime: plan.targetTime,
-        actualTime: video.currentTime,
+    if (samePendingPlan(plan, segmentKeys)) {
+      log("skip:pending:already-active", {
+        source,
+        pendingSkip,
+        plan,
         video
       });
-    } catch (error) {
-      log("skip:perform:seek-error", { error, plan, video });
+      retryPendingSkip(`${source}:already-active`);
       return;
     }
 
-    showSkipOverlay(video, types);
-
-    // If the user/player was already playing, keep it playing after the jump.
-    // This may be rejected by the browser if there has not been a user gesture.
-    if (!wasPaused) {
-      try {
-        await video.play();
-        log("skip:perform:play-resumed", { video });
-      } catch (error) {
-        log("skip:perform:play-blocked", { error, video });
-      }
+    if (!recordSkipPlanAttempt(segmentKeys, source)) {
+      return;
     }
+
+    clearPendingSkip("replaced-by-new-skip-request");
+    clearConfirmedSkipWatch("replaced-by-new-skip-request");
+
+    pendingSkip = {
+      id: nextPendingSkipId++,
+      mediaId: currentMediaId,
+      segmentKeys,
+      segments: plan.segments,
+      types,
+      targetTime: plan.targetTime,
+      wasPaused: video.paused,
+      attempts: 0,
+      createdAtMs: Date.now(),
+      lastAttemptAtMs: 0,
+      confirmAfterMs: 0,
+      videoDebugId: getVideoDebugId(video)
+    };
+
+    log("skip:pending:created", {
+      source,
+      pendingSkip,
+      from: video.currentTime,
+      to: plan.targetTime,
+      video
+    });
+
+    attemptPendingSkip(video, source);
   }
 
   function proactiveSkip(video, source = "unknown") {
     const firstSegment = currentSegments[0];
     if (!firstSegment) return;
+
+    const hasOnlyShortPreroll = firstSegment.start <= CONFIG.shortPrerollSkipThresholdSeconds;
+    if (!CONFIG.proactiveSkipEnabled && !(
+      CONFIG.shortPrerollProactiveSkipEnabled && hasOnlyShortPreroll
+    )) {
+      return;
+    }
 
     const logWaiting = (details) => {
       const now = Date.now();
@@ -785,8 +1499,19 @@
       return;
     }
     if (skippedSegmentKeys.has(key)) {
-      log("proactive:skip:rejected", { source, reason: "already-skipped", firstSegment, video });
-      return;
+      if (isSegmentSuppressed(key)) {
+        logSuppressedSkipBlocked(source, "short-preroll-recovery-suppressed", {
+          firstSegment,
+          key,
+          video
+        });
+        return;
+      }
+      if (firstSegment.start <= CONFIG.shortPrerollSkipThresholdSeconds) {
+        unmarkCurrentEpisodeSegments("playback-before-short-preroll-after-confirmed-skip");
+      } else {
+        return;
+      }
     }
     if (firstSegment.start > CONFIG.proactiveSkipThresholdSeconds) {
       logWaiting({
@@ -799,7 +1524,6 @@
     }
 
     const secondsUntilStart = firstSegment.start - t;
-    const hasOnlyShortPreroll = firstSegment.start <= CONFIG.shortPrerollSkipThresholdSeconds;
     if (secondsUntilStart > CONFIG.proactiveSkipStartToleranceSeconds && !hasOnlyShortPreroll) {
       logWaiting({
         source,
@@ -823,7 +1547,7 @@
         plan,
         video
       });
-      skipSegment(video, plan);
+      skipSegment(video, plan, `proactive:${source}`);
     }
   }
 
@@ -834,11 +1558,28 @@
       return;
     }
 
+    if (!canEvaluateSkipDecisions(video, source)) {
+      return;
+    }
+
+    if (recoverRolledBackSkip(video, source)) {
+      return;
+    }
+
+    if (pendingSkip) {
+      retryPendingSkip(`event:${source}`);
+      return;
+    }
+
     if (!currentSegments.length) {
       if (Date.now() - lastVideoStateLogAt >= CONFIG.videoStateLogIntervalMs) {
         lastVideoStateLogAt = Date.now();
         log("skip:decision:no-segments", { source, video });
       }
+      return;
+    }
+
+    if (recoverSkippedSegmentStillPlaying(video, source)) {
       return;
     }
 
@@ -856,7 +1597,7 @@
         video
       });
       const plan = buildSkipPlan(video, eligible.segment);
-      if (plan) { skipSegment(video, plan); return; }
+      if (plan) { skipSegment(video, plan, `timeupdate:${source}`); return; }
     }
 
     const interestingDecision = decisions.find((candidate) => {
@@ -898,6 +1639,11 @@
       currentMediaId = null;
       currentSegments = [];
       skippedSegmentKeys = new Set();
+      clearPendingSkip("left-watch-page");
+      clearConfirmedSkipWatch("left-watch-page");
+      clearLoopBreakerState("left-watch-page");
+      playbackStartedForMedia = false;
+      lastWaitingForPlayLogAt = 0;
     }
 
     attachToVideoWhenReady(reason);
@@ -925,6 +1671,11 @@
     currentMediaId = null;
     currentSegments = [];
     skippedSegmentKeys = new Set();
+    clearPendingSkip(`force-resync:${reason}`);
+    clearConfirmedSkipWatch(`force-resync:${reason}`);
+    clearLoopBreakerState(`force-resync:${reason}`);
+    playbackStartedForMedia = false;
+    lastWaitingForPlayLogAt = 0;
     lastVideoStateLogAt = 0;
     lastVideoScanLogAt = 0;
     lastProactiveLogAt = 0;
@@ -976,6 +1727,17 @@
     }
   }
 
+  function installWindowMessageHandler() {
+    window.addEventListener("cr-skipper-force-resync", (event) => {
+      const reason = event && event.detail && event.detail.reason
+        ? event.detail.reason
+        : "window-event";
+      log("window-message:force-resync", { reason });
+      forceResync(reason);
+    });
+    log("window-message:handler-installed");
+  }
+
   function start() {
     if (pollTimer) {
       log("extension:start:already-running");
@@ -991,13 +1753,27 @@
         proactiveSkipThresholdSeconds: CONFIG.proactiveSkipThresholdSeconds,
         shortPrerollSkipThresholdSeconds: CONFIG.shortPrerollSkipThresholdSeconds,
         proactiveSkipStartToleranceSeconds: CONFIG.proactiveSkipStartToleranceSeconds,
+        proactiveSkipEnabled: CONFIG.proactiveSkipEnabled,
+        shortPrerollProactiveSkipEnabled: CONFIG.shortPrerollProactiveSkipEnabled,
+        requirePlaybackStartedBeforeSkip: CONFIG.requirePlaybackStartedBeforeSkip,
+        enableRoutePoll: CONFIG.enableRoutePoll,
         routePollMs: CONFIG.routePollMs,
-        mirrorDebugToServiceWorker: CONFIG.mirrorDebugToServiceWorker
+        mirrorDebugToServiceWorker: CONFIG.mirrorDebugToServiceWorker,
+        skipConfirmDelayMs: CONFIG.skipConfirmDelayMs,
+        skipRetryDelayMs: CONFIG.skipRetryDelayMs,
+        skipConfirmToleranceSeconds: CONFIG.skipConfirmToleranceSeconds,
+        skipRollbackWatchMs: CONFIG.skipRollbackWatchMs,
+        maxPendingSkipAttempts: CONFIG.maxPendingSkipAttempts,
+        maxPendingSkipAgeMs: CONFIG.maxPendingSkipAgeMs,
+        maxSkipPlanAttempts: CONFIG.maxSkipPlanAttempts,
+        skipAttemptWindowMs: CONFIG.skipAttemptWindowMs,
+        skipLoopSuppressMs: CONFIG.skipLoopSuppressMs
       },
       snapshot: getDebugSnapshot()
     });
 
     installRuntimeMessageHandler();
+    installWindowMessageHandler();
 
     // Intercept history API so we detect SPA navigation the instant Crunchyroll
     // calls pushState/replaceState, before any DOM mutation fires.
@@ -1017,7 +1793,11 @@
     });
 
     tick("start");
-    pollTimer = window.setInterval(() => tick("poll"), CONFIG.routePollMs);
+    if (CONFIG.enableRoutePoll) {
+      pollTimer = window.setInterval(() => tick("poll"), CONFIG.routePollMs);
+    } else {
+      log("route:poll:disabled");
+    }
 
     observer = new MutationObserver(() => {
       tick("mutation");

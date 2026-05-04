@@ -1,17 +1,58 @@
 const DEBUG = true;
 let debugSequence = 0;
 
+function formatLogValue(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value === "number") return Number.isFinite(value) ? String(Number(value.toFixed(3))) : String(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "string") return JSON.stringify(value.length > 180 ? `${value.slice(0, 177)}...` : value);
+  return JSON.stringify(value);
+}
+
+function flattenLogDetails(value, prefix = "", output = []) {
+  if (output.length >= 30 || value === undefined) {
+    return output;
+  }
+
+  if (value === null || typeof value !== "object") {
+    output.push(`${prefix || "value"}=${formatLogValue(value)}`);
+    return output;
+  }
+
+  if (Array.isArray(value)) {
+    output.push(`${prefix || "items"}[${value.length}]`);
+    for (let index = 0; index < Math.min(value.length, 3); index += 1) {
+      flattenLogDetails(value[index], `${prefix || "item"}${index}`, output);
+    }
+    return output;
+  }
+
+  for (const [key, item] of Object.entries(value)) {
+    if (output.length >= 30) break;
+    if (item === undefined || typeof item === "function") continue;
+    flattenLogDetails(item, prefix ? `${prefix}.${key}` : key, output);
+  }
+
+  return output;
+}
+
+function formatDetailsForLog(details) {
+  if (details === undefined) {
+    return "";
+  }
+
+  const parts = flattenLogDetails(details);
+  return parts.length ? ` ${parts.join(" ")}` : "";
+}
+
 function log(step, details = undefined) {
   if (!DEBUG) {
     return;
   }
 
-  console.log("[Crunchyroll Auto Skipper SW]", {
-    sequence: ++debugSequence,
-    at: new Date().toISOString(),
-    step,
-    details
-  });
+  const sequence = ++debugSequence;
+  console.log(`[Crunchyroll Auto Skipper SW] #${sequence} ${new Date().toISOString()} ${step}${formatDetailsForLog(details)}`);
 }
 
 function describeSender(sender) {
@@ -132,31 +173,84 @@ chrome.action.onClicked.addListener((tab) => {
     return;
   }
 
+  sendForceResync(tab.id, "toolbar-action", true);
+});
+
+function sendForceResync(tabId, reason, allowInjection) {
   chrome.tabs.sendMessage(
-    tab.id,
+    tabId,
     {
       type: "CR_SKIPPER_FORCE_RESYNC",
-      reason: "toolbar-action"
+      reason
     },
     (response) => {
       if (chrome.runtime.lastError) {
+        const error = chrome.runtime.lastError.message;
         log("action:force-resync:error", {
-          tabId: tab.id,
+          tabId,
+          reason,
+          allowInjection,
+          error
+        });
+
+        if (allowInjection && error.includes("Receiving end does not exist")) {
+          injectContentScript(tabId, reason);
+        }
+        return;
+      }
+
+      log("action:force-resync:response", {
+        tabId,
+        reason,
+        ok: response && response.ok,
+        mediaId: response && response.mediaId,
+        segmentCount: response && response.segmentCount,
+        error: response && response.error
+      });
+    }
+  );
+}
+
+function injectContentScript(tabId, reason) {
+  log("action:inject-content-script:start", {
+    tabId,
+    reason
+  });
+
+  chrome.scripting.executeScript(
+    {
+      target: { tabId },
+      files: ["content.js"]
+    },
+    () => {
+      if (chrome.runtime.lastError) {
+        log("action:inject-content-script:error", {
+          tabId,
+          reason,
           error: chrome.runtime.lastError.message
         });
         return;
       }
 
-      log("action:force-resync:response", {
-        tabId: tab.id,
-        response
+      log("action:inject-content-script:complete", {
+        tabId,
+        reason
       });
+      sendForceResync(tabId, `${reason}:after-injection`, false);
     }
   );
-});
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const type = message && message.type;
+
+  if (type === "CR_SKIPPER_DEBUG_LOG") {
+    if (DEBUG && message.entry && message.entry.line) {
+      console.log(`[Crunchyroll Auto Skipper SW <= content] ${message.entry.line}`);
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
 
   log("message:received", {
     type,
@@ -164,15 +258,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     bypassHttpCache: Boolean(message && message.bypassHttpCache),
     sender: describeSender(sender)
   });
-
-  if (type === "CR_SKIPPER_DEBUG_LOG") {
-    log("content-script:debug", {
-      entry: message.entry,
-      sender: describeSender(sender)
-    });
-    sendResponse({ ok: true });
-    return false;
-  }
 
   if (type !== "GET_SKIP_EVENTS" || !message.mediaId) {
     log("message:ignored", {
