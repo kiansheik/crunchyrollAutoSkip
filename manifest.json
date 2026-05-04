@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Crunchyroll Auto Skipper",
+  "version": "0.1.0",
+  "description": "Automatically skips Crunchyroll recap/intro segments using Crunchyroll's skip-events JSON.",
+  "permissions": [],
+  "host_permissions": [
+    "https://static.crunchyroll.com/skip-events/production/*.json"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.crunchyroll.com/watch/*",
+        "https://www.crunchyroll.com/*/watch/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Crunchyroll Auto Skipper"
+  }
+}
