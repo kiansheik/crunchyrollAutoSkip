@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 280" role="img" aria-labelledby="title desc">
+  <title id="title">Crunchyroll Auto Skipper small promo tile</title>
+  <desc id="desc">Promotional tile with a skip-forward icon and concise product text.</desc>
+  <defs>
+    <linearGradient id="tile-bg" x1="40" y1="20" x2="400" y2="270" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#172033"/>
+      <stop offset="1" stop-color="#0b101c"/>
+    </linearGradient>
+    <linearGradient id="tile-ring" x1="68" y1="62" x2="188" y2="206" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffb02e"/>
+      <stop offset="0.6" stop-color="#ff7a1a"/>
+      <stop offset="1" stop-color="#ff4d35"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="440" height="280" fill="url(#tile-bg)"/>
+  <circle cx="133" cy="140" r="78" fill="none" stroke="#253149" stroke-width="22"/>
+  <path d="M133 62a78 78 0 1 1-67.57 39" fill="none" stroke="url(#tile-ring)" stroke-linecap="round" stroke-width="22"/>
+  <path d="M92 99v82l58-41-58-41Zm56 0v82l58-41-58-41Z" fill="#ffffff"/>
+  <rect x="199" y="99" width="13" height="82" rx="6.5" fill="#ffffff"/>
+  <circle cx="69" cy="101" r="8" fill="#67e8f9"/>
+
+  <text x="240" y="102" fill="#ffffff" font-family="Inter, Arial, sans-serif" font-size="27" font-weight="700">Auto skip</text>
+  <text x="240" y="138" fill="#ffb02e" font-family="Inter, Arial, sans-serif" font-size="27" font-weight="700">recaps</text>
+  <text x="240" y="174" fill="#ffb02e" font-family="Inter, Arial, sans-serif" font-size="27" font-weight="700">and intros</text>
+  <text x="240" y="211" fill="#c8d3e6" font-family="Inter, Arial, sans-serif" font-size="16">Forward-only seeking</text>
+</svg>

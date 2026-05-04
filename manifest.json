@@ -1,8 +1,16 @@
 {
   "manifest_version": 3,
   "name": "Crunchyroll Auto Skipper",
+  "short_name": "CR Skipper",
   "version": "0.1.0",
-  "description": "Automatically skips Crunchyroll recap/intro segments using Crunchyroll's skip-events JSON.",
+  "description": "Automatically skips Crunchyroll recap and intro segments while you watch episodes.",
+  "homepage_url": "https://github.com/kiansheik/crunchyrollAutoSkip",
+  "icons": {
+    "16": "assets/icons/icon16.png",
+    "32": "assets/icons/icon32.png",
+    "48": "assets/icons/icon48.png",
+    "128": "assets/icons/icon128.png"
+  },
   "permissions": [],
   "host_permissions": [
     "https://static.crunchyroll.com/skip-events/production/*.json"
@@ -23,6 +31,12 @@
     }
   ],
   "action": {
-    "default_title": "Crunchyroll Auto Skipper"
+    "default_title": "Crunchyroll Auto Skipper",
+    "default_icon": {
+      "16": "assets/icons/icon16.png",
+      "32": "assets/icons/icon32.png",
+      "48": "assets/icons/icon48.png",
+      "128": "assets/icons/icon128.png"
+    }
   }
 }
