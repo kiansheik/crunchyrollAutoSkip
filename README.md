@@ -119,13 +119,16 @@ That document includes:
 
 ## Debugging
 
-In `content.js`, temporarily set:
+This local build currently has verbose debugging enabled in both runtime scripts:
 
 ```js
 debug: true
+mirrorDebugToServiceWorker: true
 ```
 
-Then open DevTools on the Crunchyroll page and check the console for `[Crunchyroll Auto Skipper]` messages.
+Open DevTools on the Crunchyroll page for `[Crunchyroll Auto Skipper]` content-script messages. To inspect the MV3 service worker, open `chrome://extensions`, find this extension, click **service worker**, and look for `[Crunchyroll Auto Skipper SW]`.
+
+The toolbar icon also forces a resync on the active Crunchyroll tab. It asks the content script to re-read the current `/watch/<MEDIA_ID>` route, bypass the local skip-events cache, fetch fresh metadata through the service worker, reselect the video element, and print a state snapshot.
 
 Turn debug logging off before publishing a release.
 
